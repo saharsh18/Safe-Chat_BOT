@@ -3,6 +3,9 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 from trl import SFTTrainer
 from peft import LoraConfig, get_peft_model
+import os
+import csv
+import math
 
 SPECIAL_TOKENS = ["<|user|>", "<|bot|>", "<|endofbot|>"]
 
@@ -24,11 +27,11 @@ def flatten_dialogs(ds_split):
 
 def preprocess_fn(example, tok, max_len):
     text = example["prompt"] + example["response"]
-    enc = tok(text, truncation=True, max_length=max_len)
+    enc = tok(text, truncation=True, max_length=max_len, padding = "max_length")
     # mask prompt tokens -> ignore loss with -100
-    prompt_ids = tok(example["prompt"], truncation=True, max_length=max_len)["input_ids"]
+    prompt_ids = tok(example["prompt"], truncation=True, max_length=max_len, padding = "max_length")["input_ids"]
     labels = enc["input_ids"][:]
-    for i in range(min(len(labels), len(prompt_ids))):
+    for i in range(len(prompt_ids)):
         labels[i] = -100
     enc["labels"] = labels
     return enc
@@ -55,7 +58,7 @@ def main():
     args = ap.parse_args()
 
     # 1) Load DailyDialog
-    raw = load_dataset("daily_dialog")
+    raw = load_dataset("daily_dialog", trust_remote_code=True)
     train_pairs = flatten_dialogs(raw["train"])
     val_pairs   = flatten_dialogs(raw["validation"])
 
@@ -95,19 +98,26 @@ def main():
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         logging_steps=50,
+        logging_strategy="steps",
         save_total_limit=2,
-        report_to="none",
+        report_to="tensorboard",
         fp16=args.fp16,
         bf16=args.bf16
     )
 
+    def compute_metrics(eval_pred):
+        _, metrics = eval_pred
+        metrics["perplexity"] = math.exp(metrics["eval_loss"])
+        return metrics
+        
     trainer = SFTTrainer(
         model=model,
         tokenizer=tok,
         train_dataset=train_tok,
         eval_dataset=val_tok,
         args=targs,
-        packing=args.packing,  # packs multiple short samples to fill sequences
+        packing=args.packing,
+        compute_metrics=compute_metrics 
     )
 
     # 6) Train & save
