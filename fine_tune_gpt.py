@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--max_len", type=int, default=512)
     ap.add_argument("--eval_steps", type=int, default=1000)
     ap.add_argument("--save_steps", type=int, default=1000)
+    ap.add_argument("--no_eval", action="store_true", help="disable evaluation during training (can avoid OOM)")
+    ap.add_argument("--eval_accumulation_steps", type=int, default=1, help="Number of accumulation steps for evaluation to split eval batch and reduce memory")
     ap.add_argument("--packing", action="store_true", help="pack multiple samples per sequence")
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--bf16", action="store_true")
@@ -92,9 +94,10 @@ def main():
         per_device_train_batch_size=args.bsz,
         per_device_eval_batch_size=args.eval_bsz,
         gradient_accumulation_steps=args.grad_acc,
+        eval_accumulation_steps=args.eval_accumulation_steps,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
-        evaluation_strategy="steps",
+        evaluation_strategy=("no" if args.no_eval else "steps"),
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         logging_steps=50,
@@ -107,7 +110,7 @@ def main():
 
     def compute_metrics(eval_pred):
         _, metrics = eval_pred
-        metrics["perplexity"] = math.exp(metrics["eval_loss"])
+        metrics["perplexity"] = float(math.exp(min(metrics["eval_loss"], 20)))  # Cap at e^20 to prevent overflow
         return metrics
         
     trainer = SFTTrainer(

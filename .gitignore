@@ -2,46 +2,21 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
 
 # Virtual Environment
 venv/
 ENV/
 env/
 .env
-
-# PyCharm and other IDEs
-.idea/
 .vscode/
-*.swp
-*.swo
-
-# Jupyter Notebook
-.ipynb_checkpoints
 
 # Training outputs and model files
 gpt2-sft/
 gpt2-sft-lora/
 gpt2-lora-sft/
+*-sft/
 runs/
 events.out.tfevents.*
-wandb/
 *.pth
 *.ckpt
 *.pt
@@ -57,12 +32,7 @@ events.out.tfevents.*
 # Cache directories
 .cache/
 cached_*
-
-# Local development settings
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+hf_cache/
 
 # System Files
 .DS_Store
