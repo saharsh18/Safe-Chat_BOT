@@ -15,6 +15,7 @@ gpt2-sft/
 gpt2-sft-lora/
 gpt2-lora-sft/
 *-sft/
+gpt2-*/
 runs/
 events.out.tfevents.*
 *.pth
