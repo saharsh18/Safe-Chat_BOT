@@ -13,6 +13,7 @@ env/
 # Training outputs and model files
 gpt2-*/
 toxicity-classifier/
+preference-*/
 runs/
 events.out.tfevents.*
 *.pth
