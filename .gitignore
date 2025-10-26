@@ -11,11 +11,8 @@ env/
 .vscode/
 
 # Training outputs and model files
-gpt2-sft/
-gpt2-sft-lora/
-gpt2-lora-sft/
-*-sft/
 gpt2-*/
+toxicity-classifier/
 runs/
 events.out.tfevents.*
 *.pth
