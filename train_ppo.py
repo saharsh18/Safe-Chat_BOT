@@ -1,166 +1,172 @@
 import argparse
-import torch
+import os
+import time
 import gc
+import random
+from collections import defaultdict
+
+import torch
 import numpy as np
+from tqdm import tqdm
+
 from datasets import load_dataset, Dataset, concatenate_datasets
+
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    AutoModelForCausalLMWithValueHead, # Use the ValueHead model for PPO Actor
-    TrainingArguments # Used for dummy args
+    DataCollatorWithPadding,
 )
-from trl import PPOTrainer, PPOConfig, create_reference_model
-from collections import defaultdict
-import random
-from tqdm import tqdm
-import os
-import time
 
-# --- Constants ---
-# Special tokens MUST match the ones used for the baseline SFT model
-SPECIAL_TOKENS = {
-    "user": "<|user|>",
-    "bot": "<|bot|>",
-    "end": "<|endofbot|>",
-}
+from trl import (
+    PPOTrainer,
+    PPOConfig,
+    create_reference_model,
+    AutoModelForCausalLMWithValueHead,
+)
 
-# --- Prompt Dataset Configuration ---
-MAX_DAILYDIALOG_PROMPTS = 7000 # Benign
-MAX_OASST1_PROMPTS = 3000      # Benign
-MAX_HH_PROMPTS = 2000          # Provocative
-MAX_TOXICITY_PROMPTS = 2000    # Provocative
+from reward_utils import set_seed, get_raw_preference_scores, get_toxicity_scores
 
-# --- Reward Weights ---
-# These are crucial and require tuning!
-W_PREFERENCE = 1.0 # Weight for the preference model score
-W_TOXICITY = 1.0   # Weight for the (1 - toxicity_prob) score
+# ---------------- CONSTANTS ----------------
+SPECIAL_TOKENS = {"user": "<|user|>", "bot": "<|bot|>", "end": "<|endofbot|>"}
+PREF_MEAN = 0.3904
+PREF_STD = 1.8893
+TOX_MEAN = 0.4729 
+TOX_STD = 0.0424  
 
-# --- Data Processing Functions ---
+EPSILON = 1e-8 # For safe division
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+MAX_DAILYDIALOG_PROMPTS = 7000
+MAX_OASST1_PROMPTS = 3000
+MAX_HH_PROMPTS = 2500
+MAX_TOXICITY_PROMPTS = 2500
 
-def format_prompt(text):
-    """Applies the SFT chat template to a single user turn."""
+W_PREFERENCE = 1.0 
+W_TOXICITY = 1.0   
+
+INVALID_RESPONSE_REWARD = -2.0
+
+# ---------------- Helper Functions ----------------
+def format_prompt(text, tokenizer_to_use):
     messages = [{"role": "user", "content": text}]
-    # apply_chat_template will add the <|user|> and <|bot|> tokens
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer_to_use.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-def process_daily_dialog_prompts():
-    """Loads and formats DailyDialog user prompts (Benign)."""
-    print(f"Loading DailyDialog prompts (limit {MAX_DAILYDIALOG_PROMPTS})...")
+def safe_to_string(x):
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="ignore")
+    elif isinstance(x, torch.Tensor):
+        try:
+             return str(x.tolist()) 
+        except:
+             return str(x)
+    elif isinstance(x, (list, dict)):
+        return str(x)
+    else:
+        return str(x)
+
+
+def process_daily_dialog_prompts(tokenizer_, limit=MAX_DAILYDIALOG_PROMPTS):
+    print(f"Loading DailyDialog prompts (limit {limit})...")
     try:
         raw = load_dataset("daily_dialog", split="train", cache_dir=args.cache_dir)
     except Exception as e:
         print(f"Could not load DailyDialog: {e}. Skipping.")
         return None
     prompts = []
-    processed_dialog_ids = set()
+    processed_ids = set()
     raw = raw.shuffle(seed=42)
-    for example in raw:
-        if len(prompts) >= MAX_DAILYDIALOG_PROMPTS: break
-        dialog_id = example.get('id', hash(tuple(example['dialog'])))
-        if dialog_id in processed_dialog_ids: continue
-        user_turns = example["dialog"][::2] # Get user utterances
+    for ex in raw:
+        if len(prompts) >= limit: break
+        dialog_id = ex.get("id", hash(tuple(ex["dialog"])))
+        if dialog_id in processed_ids: continue
+        user_turns = ex["dialog"][::2]
         if user_turns:
-             prompts.append({"prompt": format_prompt(user_turns[0])}) # Use first user turn
-             processed_dialog_ids.add(dialog_id)
+            text = safe_to_string(user_turns[0])
+            prompts.append({"prompt": format_prompt(text, tokenizer_)})
+            processed_ids.add(dialog_id)
     print(f"Loaded {len(prompts)} prompts from DailyDialog.")
     return Dataset.from_list(prompts) if prompts else None
 
-
-def process_oasst1_prompts():
-    """Loads and formats OASST1 initial user prompts (Benign)."""
-    print(f"Loading OASST1 prompts (limit {MAX_OASST1_PROMPTS})...")
+def process_oasst1_prompts(tokenizer_, limit=MAX_OASST1_PROMPTS):
+    print(f"Loading OASST1 prompts (limit {limit})...")
     try:
         ds = load_dataset("OpenAssistant/oasst1", split="train", cache_dir=args.cache_dir)
     except Exception as e:
         print(f"Could not load OASST1: {e}. Skipping.")
         return None
-    ds_filtered = ds.filter(lambda x: x["lang"] == "en" and x["parent_id"] is None and x["role"] == "prompter")
-    if len(ds_filtered) > MAX_OASST1_PROMPTS:
-         ds_filtered = ds_filtered.shuffle(seed=42).select(range(MAX_OASST1_PROMPTS))
-    prompts = [{"prompt": format_prompt(example["text"])} for example in ds_filtered]
+    ds_filtered = ds.filter(lambda x: x.get("lang", "") == "en" and x.get("parent_id") is None and x.get("role") == "prompter")
+    if len(ds_filtered) > limit:
+        ds_filtered = ds_filtered.shuffle(seed=42).select(range(limit))
+    prompts = [{"prompt": format_prompt(safe_to_string(example["text"]), tokenizer_)} for example in ds_filtered] # Use safe_to_string
     print(f"Loaded {len(prompts)} prompts from OASST1.")
     return Dataset.from_list(prompts) if prompts else None
 
-def process_anthropic_hh_prompts():
-    """Loads human prompts from Anthropic HH (Provocative)."""
-    print(f"Loading Anthropic HH prompts (limit {MAX_HH_PROMPTS})...")
-    try:
-        # Load both helpful and harmless subsets to get a wide range of prompts
-        ds_harmless = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base", split="train", cache_dir=args.cache_dir)
-        ds_helpful = load_dataset("Anthropic/hh-rlhf", data_dir="helpful-base", split="train", cache_dir=args.cache_dir)
-        ds = concatenate_datasets([ds_harmless, ds_helpful]).shuffle(seed=42)
-    except Exception as e:
-        print(f"Could not load Anthropic/hh-rlhf: {e}. Skipping.")
-        return None
-
+def process_anthropic_hh_prompts(tokenizer_, limit=MAX_HH_PROMPTS):
+    print(f"Loading Anthropic HH prompts (limit {limit})...")
     prompts = []
-    # Extract the first human turn from the conversation
-    for example in ds:
-        if len(prompts) >= MAX_HH_PROMPTS: break
-        # Conversation is in 'chosen' (and 'rejected') field
-        conversation = example['chosen']
-        # Find the first occurrence of "\n\nHuman:"
-        human_turns = conversation.split("\n\nHuman:")
-        if len(human_turns) > 1:
-            # Get the text after the first "\n\nHuman:" and before "\n\nAssistant:"
-            first_prompt = human_turns[1].split("\n\nAssistant:")[0].strip()
-            if first_prompt:
-                prompts.append({"prompt": format_prompt(first_prompt)})
-                
+    loaded = 0
+    try:
+        for subset in ["harmless-base", "helpful-base"]:
+            if loaded >= limit: break
+            ds = load_dataset("Anthropic/hh-rlhf", data_dir=subset, split="train", cache_dir=args.cache_dir)
+            ds = ds.shuffle(seed=42)
+            for ex in ds:
+                if loaded >= limit: break
+                conversation = ex.get("chosen", "")
+                human_turns = conversation.split("\n\nHuman:")
+                if len(human_turns) > 1:
+                    first_prompt_text = human_turns[1].split("\n\nAssistant:")[0].strip()
+                    if first_prompt_text:
+                        prompts.append({"prompt": format_prompt(safe_to_string(first_prompt_text), tokenizer_)}) # Use safe_to_string
+                        loaded += 1
+    except Exception as e:
+        print(f"Could not load Anthropic/hh-rlhf: {e}")
     print(f"Loaded {len(prompts)} prompts from Anthropic HH.")
     return Dataset.from_list(prompts) if prompts else None
 
-def process_real_toxicity_prompts():
-    """Loads prompts from RealToxicityPrompts (Provocative)."""
-    print(f"Loading RealToxicityPrompts (limit {MAX_TOXICITY_PROMPTS})...")
+def process_real_toxicity_prompts(tokenizer_, limit=MAX_TOXICITY_PROMPTS):
+    print(f"Loading RealToxicityPrompts (limit {limit})...")
     try:
         ds = load_dataset("allenai/real-toxicity-prompts", split="train", cache_dir=args.cache_dir)
-        ds = ds.shuffle(seed=42).select(range(MAX_TOXICITY_PROMPTS))
+        ds = ds.shuffle(seed=42).select(range(min(limit, len(ds))))
     except Exception as e:
-        print(f"Could not load allenai/real-toxicity-prompts: {e}. Skipping.")
+        print(f"Could not load RealToxicityPrompts: {e}. Skipping.")
         return None
-    
-    # These are text fragments, we treat them as the user's prompt
-    prompts = [{"prompt": format_prompt(example["prompt"]["text"])} for example in ds]
+    prompts = [{"prompt": format_prompt(safe_to_string(example["prompt"]["text"]), tokenizer_)} for example in ds] # Use safe_to_string
     print(f"Loaded {len(prompts)} prompts from RealToxicityPrompts.")
     return Dataset.from_list(prompts) if prompts else None
 
-
 def get_prompt_dataset(tokenizer_):
-    """Combines prompts from benign and provocative sources."""
-    global tokenizer # Make tokenizer global for data processing
-    tokenizer = tokenizer_
-
-    # Load all sources
-    d_dialog = process_daily_dialog_prompts()
-    d_oasst1 = process_oasst1_prompts()
-    d_hh = process_anthropic_hh_prompts()
-    d_toxic = process_real_toxicity_prompts()
-
-    # Combine benign and provocative
-    datasets_to_combine = [d for d in [d_dialog, d_oasst1, d_hh, d_toxic] if d is not None]
+    datasets_to_combine = []
+    for fn in [process_daily_dialog_prompts]:
+        d = fn(tokenizer_)
+        if d is not None:
+            datasets_to_combine.append(d)
     if not datasets_to_combine:
-         raise ValueError("No prompt data could be loaded!")
+        raise ValueError("No prompt data loaded!")
 
     combined = concatenate_datasets(datasets_to_combine).shuffle(seed=42)
+    print(f"Total combined prompts before tokenization: {len(combined)}")
 
     def tokenize_prompt(element):
-        tokenized = tokenizer_(element["prompt"], truncation=True, max_length=args.input_max_len)
-        return {"input_ids": tokenized["input_ids"], "query": element["prompt"]}
+        text = safe_to_string(element["prompt"]) 
+        tokenized = tokenizer_(
+            text,
+            truncation=True,
+            max_length=args.input_max_len,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": tokenized["input_ids"].squeeze(0),
+            "attention_mask": tokenized["attention_mask"].squeeze(0),
+            "query": text,
+        }
 
-    combined = combined.map(tokenize_prompt, remove_columns=["prompt"])
-    combined.set_format(type="torch")
+    combined = combined.map(tokenize_prompt, remove_columns=["prompt"], batched=False) # Use batched=False for simplicity
+
+    combined.set_format(type="torch", columns=["input_ids", "attention_mask"])
     print(f"Total prompts for PPO: {len(combined)}")
     return combined
-
-# --- Reward Calculation Function ---
 
 def get_combined_rewards(
     prompts_text, responses_text,
@@ -168,286 +174,258 @@ def get_combined_rewards(
     tox_model, tox_tokenizer,
     device, args
 ):
-    """
-    Calculates the combined reward signal using Preference and Toxicity models.
-    Returns a tensor of final scores, ready for PPO.
-    """
-    batch_size = len(prompts_text)
-    pref_scores_list = [0.0] * batch_size
-    tox_scores_list = [0.0] * batch_size
+    """Calculates combined, NORMALIZED reward. Returns list of floats."""
+    if not prompts_text or not responses_text:
+        return []
 
-    # --- 1. Preference Model Score ---
-    # The PM scores the (prompt + response) concatenation
-    with torch.no_grad():
-        # Important: The PM was trained on Anthropic format (e.g., "\n\nHuman: ... \n\nAssistant: ...")
-        # Our `format_prompt` creates <|user|>...<|bot|>. This mismatch is OK
-        # as long as the PM is a general model like DistilBERT/RoBERTa,
-        # but a PM trained on <|user|> format would be ideal.
-        # For now, we simply concatenate the raw text.
-        
-        # We must decode the prompt *text* from the tensors, but batch["query"] is already text
-        # The PM needs the *full conversation context* + response.
-        # Our `prompts_text` already includes the full context up to <|bot|>
-        inputs_for_pref = pref_tokenizer(
-            [p + r for p, r in zip(prompts_text, responses_text)], # Concat prompt + response
-            padding=True,
-            truncation=True,
-            max_length=args.pref_max_len,
-            return_tensors="pt"
-        ).to(device)
+    # 1. Normalized Preference Score
+    pref_inputs = [p + r for p, r in zip(prompts_text, responses_text)]
+    raw_pref_scores = get_raw_preference_scores(
+        pref_model, pref_tokenizer, pref_inputs,
+        args.reward_batch_size, device, args.pref_max_len
+    )
+    raw_pref_scores = np.array(raw_pref_scores)
+    norm_pref_scores = (raw_pref_scores - PREF_MEAN) / (PREF_STD + EPSILON)
 
-        pref_outputs = pref_model(**inputs_for_pref)
-        pref_scores_raw = pref_outputs.logits.squeeze() # Shape: (batch_size,)
-        # Handle single-item batch
-        if pref_scores_raw.dim() == 0: pref_scores_raw = pref_scores_raw.unsqueeze(0)
-        pref_scores_list = pref_scores_raw.cpu().tolist()
+    # 2. Normalized Toxicity (Safety) Score
+    raw_safety_scores = get_toxicity_scores(
+        tox_model, tox_tokenizer, responses_text,
+        args.reward_batch_size, device, args.tox_max_len
+    )
+    raw_safety_scores = np.array(raw_safety_scores)
+    norm_safety_scores = (raw_safety_scores - TOX_MEAN) / (TOX_STD + EPSILON)
 
-    # --- 2. Toxicity Model Score ---
-    # The Toxicity model scores *only the response*
-    with torch.no_grad():
-        inputs_for_tox = tox_tokenizer(
-            responses_text, # Score only the response text
-            padding=True,
-            truncation=True,
-            max_length=args.tox_max_len,
-            return_tensors="pt"
-        ).to(device)
-
-        tox_outputs = tox_model(**inputs_for_tox)
-        tox_logits = tox_outputs.logits.squeeze() # Shape: (batch_size,)
-        # Handle single-item batch
-        if tox_logits.dim() == 0: tox_logits = tox_logits.unsqueeze(0)
-        
-        probs_undesirable = torch.sigmoid(tox_logits)
-        probs_undesirable_list = probs_undesirable.cpu().tolist()
-        # Higher score = safer (1 - prob_undesirable)
-        tox_scores_list = [1.0 - p for p in probs_undesirable_list]
-
-    # --- 3. Combine Rewards ---
+    # 3. Combine NORMALIZED scores
     final_scores = []
-    for i in range(batch_size):
-        # Weighted sum
-        score = (
-            W_PREFERENCE * pref_scores_list[i] +
-            W_TOXICITY * tox_scores_list[i]
-        )
-        final_scores.append(score)
+    for pref_score, safety_score in zip(norm_pref_scores, norm_safety_scores):
+        score = (W_PREFERENCE * float(pref_score)) + (W_TOXICITY * float(safety_score))
+        final_scores.append(float(score)) # Ensure float
 
-    # Return as tensor on the correct device
-    return torch.tensor(final_scores, dtype=torch.float32, device=device)
+    return final_scores
 
 
-# --- Main PPO Training ---
+# ---------------- Main ----------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train GPT-2 Medium with PPO using combined rewards.")
-    # Model Paths
-    parser.add_argument("--sft_model_dir", type=str, required=True, help="Path to the fine-tuned baseline SFT model.")
-    parser.add_argument("--tox_model_dir", type=str, required=True, help="Path to the trained toxicity classifier model.")
-    parser.add_argument("--pref_model_dir", type=str, required=True, help="Path to the trained preference model.")
-    parser.add_argument("--output_dir", type=str, default="gpt2-medium-ppo-combined", help="Directory to save the PPO-trained model.")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Hugging Face cache directory.")
-
-    # Dataset/Tokenization Params
-    parser.add_argument("--input_max_len", type=int, default=128, help="Max length for input prompts during PPO.")
-    parser.add_argument("--output_max_len", type=int, default=128, help="Max length for generated responses during PPO.")
-    parser.add_argument("--tox_max_len", type=int, default=128, help="Max length the toxicity classifier was trained on.")
-    parser.add_argument("--pref_max_len", type=int, default=512, help="Max length the preference model was trained on.")
-
-    # PPO Hyperparameters
-    parser.add_argument("--ppo_epochs", type=int, default=4, help="Number of PPO optimization epochs per batch.")
-    parser.add_argument("--learning_rate", type=float, default=1.41e-6, help="Adam learning rate for PPO.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for generating responses (adjust VRAM).")
-    parser.add_argument("--mini_batch_size", type=int, default=4, help="Mini-batch size for PPO updates (adjust VRAM).")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Gradient accumulation.")
-    parser.add_argument("--adap_kl_ctrl", type=bool, default=True, help="Use adaptive KL control.")
-    parser.add_argument("--init_kl_coef", type=float, default=0.05, help="Initial KL coefficient.")
-    parser.add_argument("--target_kl", type=float, default=0.05, help="Target KL value (lower = less deviation).")
-    parser.add_argument("--clip_reward", type=float, default=10.0, help="Clip rewards magnitude.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sft_model_dir", type=str, required=True)
+    parser.add_argument("--tox_model_dir", type=str, required=True)
+    parser.add_argument("--pref_model_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="ppo-output-stable")
+    parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument("--input_max_len", type=int, default=128)
+    parser.add_argument("--output_max_len", type=int, default=64)
+    parser.add_argument("--tox_max_len", type=int, default=128)
+    parser.add_argument("--pref_max_len", type=int, default=512)
+    parser.add_argument("--reward_batch_size", type=int, default=16)
+    parser.add_argument("--ppo_epochs", type=int, default=2) # Fewer epochs can be more stable
+    parser.add_argument("--learning_rate", type=float, default=1e-7) # Keep small
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--mini_batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--adap_kl_ctrl", type=bool, default=True) # Keep True
+    # --- ✨ Set a reasonable default for init_kl_coef ---
+    parser.add_argument("--init_kl_coef", type=float, default=0.05) # Lower starting value
+    # ----------------------------------------------------
+    parser.add_argument("--target_kl", type=float, default=0.03) # Slightly lower target
+    parser.add_argument("--clip_reward", type=float, default=5.0) # Lower clip range post-norm
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save_every_n_steps", type=int, default=0)
 
+    parser.add_argument("--vf_coef", type=float, default=0.2) # Increased slightly
+    parser.add_argument("--max_grad_norm", type=float, default=0.5)
     args = parser.parse_args()
+
     set_seed(args.seed)
-
-    # --- GPU Check ---
     if not torch.cuda.is_available():
-        print("ERROR: CUDA is not available. PPO training requires a GPU.")
-        exit()
-    else:
-        device = torch.device("cuda")
-        print(f"CUDA available. Using {torch.cuda.get_device_name(0)}")
+        raise SystemExit("CUDA required.")
+    device = torch.device("cuda")
+    print(f"Using {torch.cuda.get_device_name(0)}")
 
-    # --- 1. Load Models and Tokenizers ---
-    print("Loading models and tokenizers...")
-    torch_dtype = torch.bfloat16 # Use bfloat16 for all models
-
-    # SFT/PPO Tokenizer (used for generation)
-    tokenizer = AutoTokenizer.from_pretrained(args.sft_model_dir, cache_dir=args.cache_dir)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        print("Set SFT tokenizer pad_token to eos_token.")
-
-    # Toxicity Classifier Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.sft_model_dir, cache_dir=args.cache_dir, padding_side="left")
+    tokenizer.pad_token = tokenizer.eos_token
     tox_tokenizer = AutoTokenizer.from_pretrained(args.tox_model_dir, cache_dir=args.cache_dir)
-
-    # Preference Model Tokenizer
     pref_tokenizer = AutoTokenizer.from_pretrained(args.pref_model_dir, cache_dir=args.cache_dir)
+    if tox_tokenizer.pad_token is None: tox_tokenizer.pad_token = tox_tokenizer.eos_token
+    if pref_tokenizer.pad_token is None: pref_tokenizer.pad_token = pref_tokenizer.eos_token
 
-    # PPO Actor Model (with Value Head)
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        args.sft_model_dir,
-        torch_dtype=torch_dtype,
-        cache_dir=args.cache_dir
-    ).to(device)
-
-    # Reference Model (frozen copy of the SFT model)
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(args.sft_model_dir, cache_dir=args.cache_dir).to(device)
     ref_model = create_reference_model(model).to(device)
     ref_model.eval()
-
-    # Toxicity Classifier Model
-    tox_model = AutoModelForSequenceClassification.from_pretrained(
-        args.tox_model_dir,
-        torch_dtype=torch_dtype,
-        cache_dir=args.cache_dir
-    ).to(device)
+    tox_model = AutoModelForSequenceClassification.from_pretrained(args.tox_model_dir, cache_dir=args.cache_dir).to(device)
+    pref_model = AutoModelForSequenceClassification.from_pretrained(args.pref_model_dir, cache_dir=args.cache_dir).to(device)
     tox_model.eval()
-
-    # Preference Model
-    pref_model = AutoModelForSequenceClassification.from_pretrained(
-        args.pref_model_dir,
-        torch_dtype=torch_dtype,
-        cache_dir=args.cache_dir
-    ).to(device)
     pref_model.eval()
 
-    print("Models and tokenizers loaded.")
-
-    # --- 2. Prepare Prompt Dataset ---
-    print("Preparing prompt dataset...")
     dataset = get_prompt_dataset(tokenizer)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
 
-    # --- 3. Configure PPO ---
     ppo_config = PPOConfig(
         model_name=args.sft_model_dir,
         learning_rate=args.learning_rate,
-        log_with="tensorboard",
-        project_kwargs={"logging_dir": os.path.join(args.output_dir, "logs")},
         batch_size=args.batch_size,
         mini_batch_size=args.mini_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        optimize_cuda_cache=True,
-        kl_penalty="kl",
-        target=args.target_kl,
-        init_kl_coef=args.init_kl_coef,
-        adap_kl_ctrl=args.adap_kl_ctrl,
         ppo_epochs=args.ppo_epochs,
+        kl_penalty="kl",
+        adap_kl_ctrl=args.adap_kl_ctrl,
+        init_kl_coef=args.init_kl_coef, 
+        target=args.target_kl,
+        cliprange=0.1, # Use default or add as arg if needed
+        log_with="tensorboard",
+        project_kwargs={"logging_dir": os.path.join(args.output_dir, "logs")},
+        use_score_norm=True, # TRL handles batch normalization
+        score_clip=args.clip_reward, # TRL handles clipping after normalization
         seed=args.seed,
-        use_score_norm = True, # Normalize combined rewards
-        score_clip = args.clip_reward, # Clip normalized rewards
+        optimize_cuda_cache=True,
+        vf_coef=args.vf_coef,           # <-- Added/Updated
+        max_grad_norm=args.max_grad_norm
     )
+    # -----------------------------
 
-    # --- 4. Initialize PPOTrainer ---
     ppo_trainer = PPOTrainer(
         config=ppo_config,
         model=model,
         ref_model=ref_model,
         tokenizer=tokenizer,
         dataset=dataset,
+        data_collator=data_collator, # Use the collator
     )
 
-    # --- 5. Define Generation Kwargs ---
-    generation_kwargs = {
-        "min_length": -1,
-        "top_k": 50,
-        "top_p": 0.95,
-        "do_sample": True,
-        "pad_token_id": tokenizer.eos_token_id,
-        "eos_token_id": tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS["end"]),
-        "max_new_tokens": args.output_max_len,
-    }
+    # --- Generation kwargs ---
+    generation_kwargs = dict(
+        min_length=-1,
+        top_k=40, 
+        top_p=0.9, 
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS["end"]),
+        max_new_tokens=args.output_max_len,
+        temperature=0.7, 
+    )
 
-    # --- 6. PPO Training Loop ---
     print("Starting PPO training...")
-    total_ppo_steps = ppo_config.total_ppo_epochs * len(ppo_trainer.dataloader)
+    # Calculate total steps correctly based on epochs
+    total_steps_per_epoch = len(ppo_trainer.dataloader)
+    total_ppo_steps = total_steps_per_epoch * ppo_config.ppo_epochs
+    print(f"Total steps: {total_ppo_steps} ({total_steps_per_epoch} per epoch)")
 
-    for step, batch in tqdm(enumerate(ppo_trainer.dataloader), total=total_ppo_steps, desc="PPO Steps"):
-        query_tensors = batch["input_ids"] # Already tokenized prompts
-        query_texts = batch["query"]      # Raw prompt text (from get_prompt_dataset)
-        
-        # Ensure query tensors are on the correct device
-        query_tensors = query_tensors.to(device)
+    global_step = 0
 
-        start_time = time.time() # Time generation
+    # --- Explicit Epoch Loop ---
+    for epoch in range(ppo_config.ppo_epochs):
+        print(f"--- Epoch {epoch+1}/{ppo_config.ppo_epochs} ---")
+        for step, batch in tqdm(enumerate(ppo_trainer.dataloader), total=total_steps_per_epoch, desc=f"Epoch {epoch+1}"):
+            # Data collator provides tensors
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            query_texts = batch.get("query", [""] * input_ids.shape[0]) # Get strings
+            bs = input_ids.shape[0]
 
-        # Generate responses from the Actor model
-        with torch.cuda.amp.autocast(dtype=torch_dtype):
-             response_tensors = ppo_trainer.generate(
-                 query_tensors,
-                 return_prompt=False,
-                 **generation_kwargs,
-             )
-        gen_time = time.time() - start_time
-        
-        # Decode responses to text
-        try:
-             response_texts = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
-        except Exception as e:
-             print(f"Error decoding responses at step {step}: {e}")
-             continue # Skip this batch
+            # Prepare list of tensors for generate
+            query_tensors_list = [input_ids[i].detach() for i in range(bs)]
 
-        reward_start_time = time.time()
+            start_time = time.time()
+            try:
+                response_tensors = ppo_trainer.generate(
+                    query_tensors_list,
+                    return_prompt=False,
+                    **generation_kwargs,
+                ) 
+            except Exception as e:
+                print(f"Generation failed at step {step}: {e}")
+                gc.collect(); torch.cuda.empty_cache(); continue
+            gen_time = time.time() - start_time
 
-        # Filter out empty responses *before* scoring
-        valid_indices = [i for i, r in enumerate(response_texts) if r.strip()]
-        
-        if not valid_indices:
-             print(f"Warning: Step {step}: All generated responses were empty. Assigning default low reward.")
-             rewards = torch.full((len(query_tensors),), -10.0, dtype=torch.float32, device=device) # Assign large penalty
-        else:
-             # Select only valid prompts and responses for scoring
-             valid_query_texts = [query_texts[i] for i in valid_indices]
-             valid_response_texts = [response_texts[i] for i in valid_indices]
+            try:
+                response_texts = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+            except Exception as e:
+                print(f"Error decoding responses at step {step}: {e}"); continue
 
-             # Calculate combined reward scores
-             combined_scores = get_combined_rewards(
-                 valid_query_texts, valid_response_texts,
-                 pref_model, pref_tokenizer,
-                 tox_model, tox_tokenizer,
-                 device, args
-             )
-             
-             # Create a full rewards tensor, assigning a large penalty to empty responses
-             rewards = torch.full((len(query_tensors),), -10.0, dtype=torch.float32, device=device)
-             for i, score in zip(valid_indices, combined_scores):
-                 rewards[i] = score
+            # --- Compute rewards ---
+            reward_start_time = time.time()
+            valid_idx = [i for i, r in enumerate(response_texts) if r and r.strip()]
+            # Create rewards tensor on the correct device
+            rewards_tensor = torch.full((bs,), INVALID_RESPONSE_REWARD, dtype=torch.float32, device=ppo_trainer.accelerator.device)
 
-        reward_time = time.time() - reward_start_time
+            if valid_idx:
+                valid_prompts = [query_texts[i] for i in valid_idx]
+                valid_responses = [response_texts[i] for i in valid_idx]
+                combined_scores = get_combined_rewards(
+                    valid_prompts, valid_responses,
+                    pref_model, pref_tokenizer, tox_model, tox_tokenizer,
+                    device, args # Use main device for RM inference
+                )
+                if len(combined_scores) == len(valid_idx):
+                    scores_tensor = torch.tensor(combined_scores, dtype=torch.float32, device=rewards_tensor.device)
+                    rewards_tensor[torch.tensor(valid_idx, device=rewards_tensor.device)] = scores_tensor
+                else:
+                    print(f"Warning: Reward/valid mismatch step {step}. Skipping.")
 
-        # Run PPO step
-        # TRL expects lists of tensors
-        query_tensors_list = [tensor for tensor in query_tensors]
-        response_tensors_list = [tensor for tensor in response_tensors]
-        
-        try:
-            stats = ppo_trainer.step(query_tensors_list, response_tensors_list, rewards)
-            # Log custom stats
-            stats["custom/gen_time"] = gen_time
-            stats["custom/reward_time"] = reward_time
-            stats["custom/non_empty_responses"] = len(valid_indices) / len(query_tensors)
-            ppo_trainer.log_stats(stats, batch, rewards) 
-        except Exception as e:
-             print(f"Error during PPO step {step}: {e}")
-             # Decide how to handle: skip step, log error, etc.
-             continue # Skip this step
+            reward_time = time.time() - reward_start_time
 
-        # Optional: Clean GPU memory periodically
-        if (step + 1) % 50 == 0:
-             gc.collect()
-             torch.cuda.empty_cache()
+            try:
+                rewards_mean = rewards_tensor.mean().item()
+                rewards_std = rewards_tensor.std().item()
+                rewards_min = rewards_tensor.min().item()
+                rewards_max = rewards_tensor.max().item()
+                print(f"\n[Step {global_step} Epoch {epoch+1}] Rewards Stats (before TRL norm): "
+                    f"Mean={rewards_mean:.4f}, Std={rewards_std:.4f}, "
+                    f"Min={rewards_min:.4f}, Max={rewards_max:.4f}")
+                # Optional: Log shapes to double-check
+                print(f"  Query List Len: {len(query_tensors_list)}, Resp List Len: {len(response_tensors)}")
+                print(f"  Rewards Tensor Shape: {rewards_tensor.shape}")
+            except Exception as log_e:
+                print(f"Error during pre-step logging: {log_e}")
 
-    print("PPO Training complete.")
+            # Ensure these are lists of tensors on CPU
+            q_list_for_step = [q.cpu() for q in query_tensors_list]
+            r_list_for_step = [r.cpu() for r in response_tensors]
+            rewards_list_for_step = [r for r in rewards_tensor.cpu()]
 
-    # --- 7. Save Final Model ---
-    print(f"Saving final PPO model to '{args.output_dir}'...")
+            # Perform PPO step
+            try:
+                stats = ppo_trainer.step(q_list_for_step, r_list_for_step, rewards_list_for_step)
+
+                # --- ✨ Safely Get and Format Stats ✨ ---
+                vf_loss = stats.get('objective/loss_value', None)
+                policy_loss = stats.get('objective/loss_policy', None)
+                kl_div = stats.get('objective/kl', None) # Get KL from stats
+
+                # Format safely, printing 'N/A' if value is None
+                kl_str = f"{kl_div:.4f}" if kl_div is not None else "N/A"
+                vf_loss_str = f"{vf_loss:.4f}" if vf_loss is not None else "N/A"
+                policy_loss_str = f"{policy_loss:.4f}" if policy_loss is not None else "N/A"
+
+                print(f"  PPO Step Output: KL={kl_str}, VF Loss={vf_loss_str}, Policy Loss={policy_loss_str}")
+                # ----------------------------------------
+
+                # Add custom stats AFTER they are computed/retrieved
+                stats["custom/gen_time"] = gen_time
+                stats["custom/reward_time"] = reward_time
+                stats["custom/non_empty_responses"] = len(valid_idx) / bs if bs > 0 else 0.0
+
+                # Log stats using TRL's method (handles None implicitly for logging)
+                ppo_trainer.log_stats(stats, {"query": query_texts[:3]}, rewards_tensor.cpu().tolist())
+
+            except Exception as e:
+                print(f"Error during PPO step {step} in epoch {epoch+1}: {e}")
+                gc.collect(); torch.cuda.empty_cache(); continue
+
+            # Housekeeping
+            global_step += 1
+            if global_step % 50 == 0:
+                gc.collect(); torch.cuda.empty_cache()
+
+            # Optional periodic save
+            if args.save_every_n_steps > 0 and (global_step % args.save_every_n_steps == 0):
+                print(f"Saving intermediate model at step {global_step}...")
+                save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                os.makedirs(save_dir, exist_ok=True) # Ensure dir exists
+                ppo_trainer.save_pretrained(save_dir)
+                tokenizer.save_pretrained(save_dir)
+
+    print("PPO Training complete. Saving final model...")
+    os.makedirs(args.output_dir, exist_ok=True)
     ppo_trainer.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print("PPO model saved successfully.")
+    print("Saved to:", args.output_dir)
