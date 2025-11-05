@@ -1,0 +1,95 @@
+Evaluation results for model: gpt2-medium-sft-mixed-stable-not-safe
+Base model: gpt2-medium
+Device: cuda
+
+Starting Quantitative Evaluation (Loss, Perplexity)...
+   - Using batch size: 2
+
+--- Quantitative Metrics (Loss) ---
+Average Evaluation Loss: 1.8718
+Perplexity: 6.5000
+
+Starting Qualitative Evaluation...
+--- Sample 1/5 ---
+Context:
+<|user|>my mp3 player is broken , so I want to change it for an mp4 player . Can you offer any advice about which brand and model to buy ? 
+<|bot|> an mp4 player ? why don't you buy a new cell phone ? You can find an mp4 player inside any of the latest cell phones . <|endofbot|>
+<|user|> Oh , that's a good idea . Perhaps I should have a try . 
+<|bot|> look at my cell phone . I can listen to music , watch movies , take pictures , play games , surf the web and download documents . It's just like a PAD . <|endofbot|>
+<|user|> that's cool . I can use the computer and the internet pretty well , but I'm a little bit slow in the latest trends of digital products . 
+<|bot|> that's Ok . you know , digital devices are becoming smaller and easier to carry , and they won't cost you too much . <|endofbot|>
+<|user|> yeah , if I buy a cell phone like this , I don't have to take a music player everywhere I go , and I can save the cost of buying an extra mp4 . 
+<|bot|> that's right . what's the flash memory of your old mp3 ? <|endofbot|>
+<|user|> 256MB . 
+<|bot|>
+Expected Response:
+ then any cell phone can meet your need because they generally have memories of over 512MB . 
+    Generated Response:
+ that's really fast for a new mp3 player ! 
+
+--- Sample 2/5 ---
+Context:
+<|user|>What is the annual salary for this job ? 
+<|bot|> The annual salary is sixty-five thousand dollars per year . <|endofbot|>
+<|user|> What does the benefits package include ? 
+<|bot|> This job pays for half of your medical , dental , and disability . <|endofbot|>
+<|user|> Do we get paid time off ? 
+<|bot|> You have a total of 21 days paid time off which can be used for vacation , personal , or sick leave . <|endofbot|>
+<|user|> How about retirement ? 
+<|bot|> We still offer a traditional retirement plan that pays out if you stay with the company for 5 years or more . <|endofbot|>
+<|user|> Can I get company provided specialized training ? 
+<|bot|> We offer full tuition reimbursement for job related classes . <|endofbot|>
+<|user|> Where is the benefits office ? 
+<|bot|>
+Expected Response:
+ It's on the second floor in Suite 201 . 
+    Generated Response:
+ It is located on the second floor of the company . 
+
+--- Sample 3/5 ---
+Context:
+<|user|>It is my first time coming to China . I want to buy something unique of China to my friends as gifts . 
+<|bot|> We have a great variety of Chinese antiques and porcelain . Do you like them ? <|endofbot|>
+<|user|> Yes , I love them , but they are fragile . It is not convenient to take them . 
+<|bot|> You are right . How about paintings and embroidered handkerchiefs ? <|endofbot|>
+<|user|> Sounds good . May I have a look ? 
+<|bot|> Of course . These paintings have many designs , such as animals , flowers , landscape , aquatics and so on . <|endofbot|>
+<|user|> They are beautiful , but I can't understand the connotation in them . Let me see the handkerchiefs . 
+<|bot|> All right . Chinese embroidery is one traditional art with elaborate design and high quality . <|endofbot|>
+<|user|> Oh , I like the bamboo design . What is this ? 
+<|bot|> This is a series of animals , called Chinese zodiac . <|endofbot|>
+<|user|> Good . So I will take three series and five bamboo ones . 
+<|bot|>
+Expected Response:
+ OK , I will wrap them for you . 
+    Generated Response:
+ You will have to choose one of each , please . 
+
+--- Sample 4/5 ---
+Context:
+<|user|>Excuse me . This bus goes downtown , doesn't it ? 
+<|bot|> Yes . Where do you want to go ? <|endofbot|>
+<|user|> The Workers'Stadium . 
+<|bot|> This is the right bus . <|endofbot|>
+<|user|> Will you let me know where to get off ? 
+<|bot|> Certainly.Four more stop after this . I'll call out the stops . <|endofbot|>
+<|bot|>
+Expected Response:
+ Thank you . 
+    Generated Response:
+ All right . 
+ Will you give me the time ? 
+
+--- Sample 5/5 ---
+Context:
+<|user|>What shall we do tonight ? 
+<|bot|> How about the cinema ? <|endofbot|>
+<|user|> That's a good idea . We haven't seen a film for ages . What would you like to see ? 
+<|bot|> Oh I don't know . Titanic ? <|endofbot|>
+<|bot|>
+Expected Response:
+ Titanic ? That old film ? but I've seen it before ! 
+    Generated Response:
+ That was a classic . 
+ Oh I don't know what's so good about it . 
+

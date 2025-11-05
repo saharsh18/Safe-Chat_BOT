@@ -1,0 +1,26 @@
+{
+    "metadata": {
+        "model_dir": "toxicity-model/",
+        "base_model": "distilbert-base-uncased",
+        "device": "cuda",
+        "max_len": 128,
+        "evaluation_timestamp": "2025-11-05T17:41:47.731021",
+        "total_samples": 10000,
+        "max_possible_label": 7.0,
+        "accuracy_tolerance": 0.5
+    },
+    "quantitative_metrics": {
+        "eval_loss": 0.0723855197429657,
+        "eval_model_preparation_time": 0.001,
+        "eval_rmse": 0.2690455718702051,
+        "eval_mae": 0.16230253875255585,
+        "eval_mse": 0.0723855197429657,
+        "eval_r2_score": 0.6604639291763306,
+        "eval_max_ae": 2.0898184776306152,
+        "eval_cv_rmse_percent": 113.65427919872717,
+        "eval_thresholded_accuracy": 0.9247,
+        "eval_runtime": 10.8905,
+        "eval_samples_per_second": 918.231,
+        "eval_steps_per_second": 28.741
+    }
+}

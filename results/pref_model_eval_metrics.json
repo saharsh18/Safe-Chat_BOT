@@ -1,0 +1,11 @@
+{
+    "eval_accuracy": 69.8938704786658,
+    "eval_loss": 0.5866401806525293,
+    "eval_avg_score_chosen": 0.5021440791422435,
+    "eval_avg_score_rejected": -0.4839324155717101,
+    "eval_avg_score_diff": 0.9860764947139535,
+    "total_pairs": 4617,
+    "total_correct": 3227,
+    "model_path": "preference-model-deberta-v3/",
+    "max_eval_samples": 4617
+}

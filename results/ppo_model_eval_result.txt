@@ -1,0 +1,16 @@
+--- Evaluation Complete ---
+
+Model: ./ppo-output-stable
+Evaluated on 5688 samples.
+Average Reward: -0.3327
+Standard Deviation of Reward: 1.1132
+Mean Preference Score (raw): -0.7485
+Mean Toxicity Score (raw): 0.0134
+
+--- Evaluation Complete ---
+Model: ./gpt2-medium-sft-mixed-stable-not-safe
+Evaluated on 5688 samples.
+Average Reward: -0.4462
+Standard Deviation of Reward: 2.2296
+Mean Preference Score (raw): -1.0167
+Mean Toxicity Score (raw): 0.0124

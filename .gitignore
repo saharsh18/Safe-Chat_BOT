@@ -15,7 +15,6 @@ gpt2-*/
 ppo-*/
 toxicity-*/
 preference-*/
-results/
 runs/
 events.out.tfevents.*
 *.pth
