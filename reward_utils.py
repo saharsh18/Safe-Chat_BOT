@@ -84,9 +84,9 @@ def get_toxicity_scores(model, tokenizer, texts, batch_size, device, max_length)
             
             # Get the raw logit
             outputs = model(**inputs)
-            logits = outputs.logits.squeeze().cpu() # Shape: (batch_size,)
+            logits = outputs.logits.squeeze().cpu() 
             
-            if logits.dim() == 0: # Handle batch size of 1
+            if logits.dim() == 0: 
                 logits = logits.unsqueeze(0)
 
             # Convert logit to probability and then to safety score

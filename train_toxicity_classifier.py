@@ -40,14 +40,16 @@ def process_civil_comments_data():
     except Exception as e:
         print(f"Could not load civil_comments dataset: {e}. Skipping.")
         return None
+    
 
     def create_regression_label(example):
         scores = [float(example[col]) for col in TOXICITY_COLUMNS]
-        max_score = np.max(scores)
+        max_score = np.sum(scores)
         return {
             "text": example[CIVIL_TEXT_COL],
             "label": max_score 
         }
+        
 
     dataset = dataset.map(create_regression_label, remove_columns=dataset.column_names)
     print(f"Processed {len(dataset)} civil_comments samples using MAX score from 7 columns.")
@@ -137,7 +139,7 @@ def train_classifier(args):
 # --- Script Entry Point ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a toxicity/undesirability classifier.")
-    parser.add_argument("--out_dir", type=str, default="toxicity-classifier", help="Directory to save the model.")
+    parser.add_argument("--out_dir", type=str, default="toxicity-classifier2", help="Directory to save the model.")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate.")
     parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=16, help="Training batch size (per device).")

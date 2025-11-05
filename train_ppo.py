@@ -6,6 +6,7 @@ import random
 from collections import defaultdict
 
 import torch
+from torch.optim import AdamW
 import numpy as np
 from tqdm import tqdm
 
@@ -14,6 +15,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
     DataCollatorWithPadding,
 )
 
@@ -28,20 +30,20 @@ from reward_utils import set_seed, get_raw_preference_scores, get_toxicity_score
 
 # ---------------- CONSTANTS ----------------
 SPECIAL_TOKENS = {"user": "<|user|>", "bot": "<|bot|>", "end": "<|endofbot|>"}
-PREF_MEAN = 0.3904
-PREF_STD = 1.8893
-TOX_MEAN = 0.4729 
-TOX_STD = 0.0424  
+PREF_MEAN = 0.4913
+PREF_STD = 1.9863
+TOX_MEAN = 0.4431
+TOX_STD = 0.0878
 
 EPSILON = 1e-8 # For safe division
 
-MAX_DAILYDIALOG_PROMPTS = 7000
+MAX_DAILYDIALOG_PROMPTS = 10000
 MAX_OASST1_PROMPTS = 3000
-MAX_HH_PROMPTS = 2500
+MAX_HH_PROMPTS = 5000
 MAX_TOXICITY_PROMPTS = 2500
 
-W_PREFERENCE = 1.0 
-W_TOXICITY = 1.0   
+W_PREFERENCE = 1.0
+W_TOXICITY = PREF_STD / (TOX_STD + EPSILON)   
 
 INVALID_RESPONSE_REWARD = -2.0
 
@@ -137,7 +139,10 @@ def process_real_toxicity_prompts(tokenizer_, limit=MAX_TOXICITY_PROMPTS):
 
 def get_prompt_dataset(tokenizer_):
     datasets_to_combine = []
-    for fn in [process_daily_dialog_prompts]:
+    for fn in [process_daily_dialog_prompts,
+        process_oasst1_prompts,
+        process_anthropic_hh_prompts,
+        process_real_toxicity_prompts]:
         d = fn(tokenizer_)
         if d is not None:
             datasets_to_combine.append(d)
@@ -185,7 +190,7 @@ def get_combined_rewards(
         args.reward_batch_size, device, args.pref_max_len
     )
     raw_pref_scores = np.array(raw_pref_scores)
-    norm_pref_scores = (raw_pref_scores - PREF_MEAN) / (PREF_STD + EPSILON)
+    norm_pref_scores = (raw_pref_scores - PREF_MEAN)
 
     # 2. Normalized Toxicity (Safety) Score
     raw_safety_scores = get_toxicity_scores(
@@ -193,13 +198,14 @@ def get_combined_rewards(
         args.reward_batch_size, device, args.tox_max_len
     )
     raw_safety_scores = np.array(raw_safety_scores)
-    norm_safety_scores = (raw_safety_scores - TOX_MEAN) / (TOX_STD + EPSILON)
+    norm_safety_scores = (raw_safety_scores - TOX_MEAN)
 
     # 3. Combine NORMALIZED scores
     final_scores = []
     for pref_score, safety_score in zip(norm_pref_scores, norm_safety_scores):
         score = (W_PREFERENCE * float(pref_score)) + (W_TOXICITY * float(safety_score))
         final_scores.append(float(score)) # Ensure float
+        
 
     return final_scores
 
@@ -210,28 +216,28 @@ if __name__ == "__main__":
     parser.add_argument("--sft_model_dir", type=str, required=True)
     parser.add_argument("--tox_model_dir", type=str, required=True)
     parser.add_argument("--pref_model_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="ppo-output-stable")
+    parser.add_argument("--output_dir", type=str, default="ppo-output-stable-tox")
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--input_max_len", type=int, default=128)
     parser.add_argument("--output_max_len", type=int, default=64)
     parser.add_argument("--tox_max_len", type=int, default=128)
     parser.add_argument("--pref_max_len", type=int, default=512)
     parser.add_argument("--reward_batch_size", type=int, default=16)
-    parser.add_argument("--ppo_epochs", type=int, default=2) # Fewer epochs can be more stable
+    parser.add_argument("--ppo_epochs", type=int, default=1) # Fewer epochs can be more stable
     parser.add_argument("--learning_rate", type=float, default=1e-7) # Keep small
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--mini_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--adap_kl_ctrl", type=bool, default=True) # Keep True
     # --- ✨ Set a reasonable default for init_kl_coef ---
-    parser.add_argument("--init_kl_coef", type=float, default=0.05) # Lower starting value
+    parser.add_argument("--init_kl_coef", type=float, default=0.2) # Lower starting value
     # ----------------------------------------------------
-    parser.add_argument("--target_kl", type=float, default=0.03) # Slightly lower target
+    parser.add_argument("--target_kl", type=float, default=0.1) # Slightly lower target
     parser.add_argument("--clip_reward", type=float, default=5.0) # Lower clip range post-norm
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_every_n_steps", type=int, default=0)
 
-    parser.add_argument("--vf_coef", type=float, default=0.2) # Increased slightly
+    parser.add_argument("--vf_coef", type=float, default=0.1) # Increased slightly
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -242,23 +248,64 @@ if __name__ == "__main__":
     print(f"Using {torch.cuda.get_device_name(0)}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.sft_model_dir, cache_dir=args.cache_dir, padding_side="left")
-    tokenizer.pad_token = tokenizer.eos_token
+  
+    
+    pad_token_id = tokenizer.pad_token_id
+    print(pad_token_id)
+
+    special_tokens_dict = {'additional_special_tokens': list(SPECIAL_TOKENS.values())}
+    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+    print(f"Added {num_added_toks} new tokens.")
+
+    end_token = SPECIAL_TOKENS["end"]
+    end_token_id = tokenizer.convert_tokens_to_ids(end_token)
+    pad_token_id = tokenizer.pad_token_id
+    user_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS["user"])
+    
+    print(f"Pad Token ID: {pad_token_id}, End Token ID: {end_token_id}")
+
     tox_tokenizer = AutoTokenizer.from_pretrained(args.tox_model_dir, cache_dir=args.cache_dir)
     pref_tokenizer = AutoTokenizer.from_pretrained(args.pref_model_dir, cache_dir=args.cache_dir)
     if tox_tokenizer.pad_token is None: tox_tokenizer.pad_token = tox_tokenizer.eos_token
     if pref_tokenizer.pad_token is None: pref_tokenizer.pad_token = pref_tokenizer.eos_token
 
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(args.sft_model_dir, cache_dir=args.cache_dir).to(device)
-    ref_model = create_reference_model(model).to(device)
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(args.sft_model_dir, cache_dir=args.cache_dir)
+    
+    model.config.pad_token_id = pad_token_id
+    model.pretrained_model.config.pad_token_id = pad_token_id
+    model.config.eos_token_id = end_token_id
+    model.pretrained_model.config.eos_token_id = end_token_id
+   
+
+    print("Zero-initializing value head for stability...")
+    with torch.no_grad():
+        for param in model.v_head.parameters():
+            param.zero_()
+
+    model = model.to(device)
+
+    print("Creating reference model...")
+    ref_model = create_reference_model(model)
+
+    print("Zero-initializing REF model's value head for stability...")
+    with torch.no_grad():
+        for param in ref_model.v_head.parameters():
+            param.zero_()
+
+    print("resizing both models")
+    model.pretrained_model.resize_token_embeddings(len(tokenizer))
+    ref_model.pretrained_model.resize_token_embeddings(len(tokenizer))
+
     ref_model.eval()
-    tox_model = AutoModelForSequenceClassification.from_pretrained(args.tox_model_dir, cache_dir=args.cache_dir).to(device)
-    pref_model = AutoModelForSequenceClassification.from_pretrained(args.pref_model_dir, cache_dir=args.cache_dir).to(device)
+    reward_device = torch.device("cpu")
+    tox_model = AutoModelForSequenceClassification.from_pretrained(args.tox_model_dir, cache_dir=args.cache_dir).to(reward_device)
+    pref_model = AutoModelForSequenceClassification.from_pretrained(args.pref_model_dir, cache_dir=args.cache_dir).to(reward_device)
     tox_model.eval()
     pref_model.eval()
 
     dataset = get_prompt_dataset(tokenizer)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
-
+    print(args.learning_rate)
     ppo_config = PPOConfig(
         model_name=args.sft_model_dir,
         learning_rate=args.learning_rate,
@@ -270,14 +317,16 @@ if __name__ == "__main__":
         adap_kl_ctrl=args.adap_kl_ctrl,
         init_kl_coef=args.init_kl_coef, 
         target=args.target_kl,
-        cliprange=0.1, # Use default or add as arg if needed
+        cliprange=0.1, 
+        cliprange_value=0.2,
         log_with="tensorboard",
+        accelerator_kwargs={"mixed_precision": "bf16"},
         project_kwargs={"logging_dir": os.path.join(args.output_dir, "logs")},
-        use_score_norm=True, # TRL handles batch normalization
+        use_score_norm=True, # Re-normalize our combined reward
         score_clip=args.clip_reward, # TRL handles clipping after normalization
         seed=args.seed,
         optimize_cuda_cache=True,
-        vf_coef=args.vf_coef,           # <-- Added/Updated
+        vf_coef=args.vf_coef,           
         max_grad_norm=args.max_grad_norm
     )
     # -----------------------------
@@ -288,21 +337,22 @@ if __name__ == "__main__":
         ref_model=ref_model,
         tokenizer=tokenizer,
         dataset=dataset,
-        data_collator=data_collator, # Use the collator
+        data_collator=data_collator
     )
+
 
     # --- Generation kwargs ---
     generation_kwargs = dict(
         min_length=-1,
-        top_k=40, 
-        top_p=0.9, 
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS["end"]),
+        do_sample=True,    
+        top_k=50,           
+        top_p=0.9,           
+        temperature=1.0,
+        pad_token_id=pad_token_id,
+        eos_token_id=[end_token_id, user_token_id],
         max_new_tokens=args.output_max_len,
-        temperature=0.7, 
     )
-
+    print(generation_kwargs["do_sample"])
     print("Starting PPO training...")
     # Calculate total steps correctly based on epochs
     total_steps_per_epoch = len(ppo_trainer.dataloader)
@@ -353,7 +403,7 @@ if __name__ == "__main__":
                 combined_scores = get_combined_rewards(
                     valid_prompts, valid_responses,
                     pref_model, pref_tokenizer, tox_model, tox_tokenizer,
-                    device, args # Use main device for RM inference
+                    reward_device, args
                 )
                 if len(combined_scores) == len(valid_idx):
                     scores_tensor = torch.tensor(combined_scores, dtype=torch.float32, device=rewards_tensor.device)
@@ -377,19 +427,20 @@ if __name__ == "__main__":
             except Exception as log_e:
                 print(f"Error during pre-step logging: {log_e}")
 
-            # Ensure these are lists of tensors on CPU
-            q_list_for_step = [q.cpu() for q in query_tensors_list]
-            r_list_for_step = [r.cpu() for r in response_tensors]
-            rewards_list_for_step = [r for r in rewards_tensor.cpu()]
+           
+            rewards_list_of_tensors = [r for r in rewards_tensor]
 
             # Perform PPO step
             try:
-                stats = ppo_trainer.step(q_list_for_step, r_list_for_step, rewards_list_for_step)
+                stats = ppo_trainer.step(
+                    query_tensors_list,  
+                    response_tensors,    
+                    rewards_list_of_tensors
+                )
 
-                # --- ✨ Safely Get and Format Stats ✨ ---
-                vf_loss = stats.get('objective/loss_value', None)
-                policy_loss = stats.get('objective/loss_policy', None)
-                kl_div = stats.get('objective/kl', None) # Get KL from stats
+                vf_loss = stats.get('ppo/loss/value', None)
+                policy_loss = stats.get('ppo/loss/policy', None)
+                kl_div = stats.get('objective/kl', None)
 
                 # Format safely, printing 'N/A' if value is None
                 kl_str = f"{kl_div:.4f}" if kl_div is not None else "N/A"
@@ -399,28 +450,25 @@ if __name__ == "__main__":
                 print(f"  PPO Step Output: KL={kl_str}, VF Loss={vf_loss_str}, Policy Loss={policy_loss_str}")
                 # ----------------------------------------
 
-                # Add custom stats AFTER they are computed/retrieved
                 stats["custom/gen_time"] = gen_time
                 stats["custom/reward_time"] = reward_time
                 stats["custom/non_empty_responses"] = len(valid_idx) / bs if bs > 0 else 0.0
 
-                # Log stats using TRL's method (handles None implicitly for logging)
+                # Log stats using TRL's method 
                 ppo_trainer.log_stats(stats, {"query": query_texts[:3]}, rewards_tensor.cpu().tolist())
 
             except Exception as e:
                 print(f"Error during PPO step {step} in epoch {epoch+1}: {e}")
                 gc.collect(); torch.cuda.empty_cache(); continue
 
-            # Housekeeping
             global_step += 1
             if global_step % 50 == 0:
                 gc.collect(); torch.cuda.empty_cache()
 
-            # Optional periodic save
             if args.save_every_n_steps > 0 and (global_step % args.save_every_n_steps == 0):
                 print(f"Saving intermediate model at step {global_step}...")
                 save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                os.makedirs(save_dir, exist_ok=True) # Ensure dir exists
+                os.makedirs(save_dir, exist_ok=True) 
                 ppo_trainer.save_pretrained(save_dir)
                 tokenizer.save_pretrained(save_dir)
 

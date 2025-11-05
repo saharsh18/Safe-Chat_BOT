@@ -9,11 +9,10 @@ import random
 import numpy as np
 
 # --- Constants ---
-# Dataset Configuration
 DATASET_NAME = "Anthropic/hh-rlhf"
-DATASET_SUBSETS = "harmless-base,helpful-base" # Using both harmless and helpful
+DATASET_SUBSETS = "harmless-base,helpful-base"
 TRAIN_SPLIT = "train"
-MAX_LENGTH = 512 # Max sequence length for tokenizer during PM training
+MAX_LENGTH = 512 
 
 # --- Helper Functions ---
 
@@ -26,15 +25,22 @@ def set_seed(seed):
 
 def preprocess_anthropic_hh(examples, tokenizer, max_length):
     """
-    Tokenizes the chosen and rejected texts for the RewardTrainer.
+    Tokenizes chosen and rejected texts for RewardTrainer.
     """
     new_examples = {
         "input_ids_chosen": [], "attention_mask_chosen": [],
         "input_ids_rejected": [], "attention_mask_rejected": []
     }
+
     for chosen, rejected in zip(examples["chosen"], examples["rejected"]):
-        tokenized_chosen = tokenizer(chosen, truncation=True, max_length=max_length)
-        tokenized_rejected = tokenizer(rejected, truncation=True, max_length=max_length)
+       
+        chosen_text = chosen.strip()
+        rejected_text = rejected.strip()
+
+        
+        # The RewardTrainer's collator will handle padding dynamically.
+        tokenized_chosen = tokenizer(chosen_text, truncation=True, max_length=max_length)
+        tokenized_rejected = tokenizer(rejected_text, truncation=True, max_length=max_length)
 
         new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
         new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
@@ -43,85 +49,77 @@ def preprocess_anthropic_hh(examples, tokenizer, max_length):
 
     return new_examples
 
-# --- Main Training Function ---
+
+# --- Main ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Preference Model (Reward Model) on Anthropic HH-RLHF.")
-    # Model & Output Args
-    parser.add_argument("--base_model", type=str, default="distilbert-base-uncased", help="Base model name or path (e.g., distilbert, gpt2).")
-    parser.add_argument("--output_dir", type=str, default="preference-model", help="Directory to save the trained preference model.")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Hugging Face cache directory.")
+    
+    parser.add_argument("--base_model", type=str, default="microsoft/deberta-v3-base")
+    parser.add_argument("--output_dir", type=str, default="preference-model-deberta-v3")
+    parser.add_argument("--cache_dir", type=str, default=None)
 
-    # Training Hyperparameters
-    parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate.")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Train batch size per GPU (adjust based on VRAM).")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps.")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for learning rate scheduler.")
-    parser.add_argument("--logging_steps", type=int, default=50, help="Log training metrics every N steps.")
-    parser.add_argument("--save_steps", type=int, default=200, help="Save checkpoint every N steps.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--learning_rate", type=float, default=3e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--logging_steps", type=int, default=50)
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
 
     args = parser.parse_args()
     set_seed(args.seed)
 
-    # --- GPU Check ---
-    if not torch.cuda.is_available():
-        print("WARNING: CUDA not available, training on CPU. This will be very slow.")
-        device = torch.device("cpu")
-    else:
-        device = torch.device("cuda")
-        print(f"CUDA available. Using {torch.cuda.get_device_name(0)}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     # --- 1. Load Tokenizer ---
     print(f"Loading tokenizer: {args.base_model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, cache_dir=args.cache_dir)
-    if "gpt2" in args.base_model.lower() and tokenizer.pad_token is None:
-         tokenizer.pad_token = tokenizer.eos_token
-         print("Set pad_token to eos_token for GPT2-based model.")
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = "[PAD]"
+        print(f"Set pad_token = {tokenizer.pad_token}")
 
-    # --- 2. Load and Process Dataset ---
-    print(f"Loading dataset: {DATASET_NAME} (subsets: {DATASET_SUBSETS})...")
-    subsets_to_load = DATASET_SUBSETS.split(',')
+    # --- 2. Load Dataset ---
+    print(f"Loading dataset: {DATASET_NAME} ({DATASET_SUBSETS})...")
+    subsets = [s.strip() for s in DATASET_SUBSETS.split(",")]
     train_datasets = []
 
-    for sub in subsets_to_load:
-        print(f"  Loading subset: {sub.strip()}")
+    for sub in subsets:
         try:
-            if "/" in DATASET_NAME: # Needs data_dir
-                train_ds = load_dataset(DATASET_NAME, data_dir=sub.strip(), split=TRAIN_SPLIT, cache_dir=args.cache_dir)
-            else: 
-                train_ds = load_dataset(DATASET_NAME, name=sub.strip(), split=TRAIN_SPLIT, cache_dir=args.cache_dir)
+            train_ds = load_dataset(DATASET_NAME, data_dir=sub, split=TRAIN_SPLIT, cache_dir=args.cache_dir)
             train_datasets.append(train_ds)
         except Exception as e:
-            print(f"  Warning: Could not load subset '{sub.strip()}': {e}")
+            print(f"Could not load subset '{sub}': {e}")
 
-    # Check only train_datasets
     if not train_datasets:
-        raise ValueError("Failed to load any training dataset subsets specified in constants.")
+        raise ValueError("No training data loaded.")
 
-    train_dataset = concatenate_datasets(train_datasets)
+    train_dataset = concatenate_datasets(train_datasets).shuffle(seed=args.seed)
     print(f"Total train examples: {len(train_dataset)}")
 
-    train_dataset = train_dataset.shuffle(seed=args.seed)
-
-    print("Preprocessing dataset...")
+    # --- 3. Preprocess ---
+    print("Tokenizing train dataset...")
     train_dataset = train_dataset.map(
-        preprocess_anthropic_hh, batched=True,
+        preprocess_anthropic_hh,
+        batched=True,
         fn_kwargs={"tokenizer": tokenizer, "max_length": MAX_LENGTH},
-        remove_columns=train_dataset.column_names
+        remove_columns=train_dataset.column_names,
     )
 
-    # Filter out examples where chosen/rejected are identical after tokenization
     train_dataset = train_dataset.filter(lambda x: x['input_ids_chosen'] != x['input_ids_rejected'])
     print(f"Filtered train examples: {len(train_dataset)}")
 
-    # --- 3. Load Base Model for Reward Modeling ---
+    # --- 4. Load Model ---
     print(f"Loading base model: {args.base_model}...")
     model = AutoModelForSequenceClassification.from_pretrained(
-        args.base_model, num_labels=1, cache_dir=args.cache_dir,
+        args.base_model, num_labels=1, cache_dir=args.cache_dir
     )
 
-    # --- 4. Configure Training ---
+    # --- 5. Training Args ---
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -129,34 +127,37 @@ if __name__ == "__main__":
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
-        warmup_ratio=args.warmup_ratio,
         logging_dir=os.path.join(args.output_dir, "logs"),
         logging_steps=args.logging_steps,
-        fp16=torch.cuda.is_available(), 
-        evaluation_strategy="no",
-        save_strategy="steps", # Keep saving checkpoints based on steps
+        evaluation_strategy="no", 
+        save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=2,
         report_to="tensorboard",
         remove_unused_columns=False,
         seed=args.seed,
+        lr_scheduler_type="cosine",
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
     )
 
-    # --- 5. Initialize RewardTrainer ---
+    # --- 6. Trainer ---
+    print("Initializing RewardTrainer...")
     trainer = RewardTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
+        max_length=MAX_LENGTH 
     )
 
-    # --- 6. Train ---
-    print("Starting Preference Model training...")
+    # --- 7. Train ---
+    print(" Starting Preference Model training...")
     trainer.train()
-    print("Training complete.")
+    print(" Training complete.")
 
-    # --- 7. Save Final Model ---
-    print(f"Saving final preference model to '{args.output_dir}'...")
+    # --- 8. Save ---
+    print(f" Saving model to {args.output_dir}...")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print("Preference model saved successfully.")
+    print(" Model saved successfully.")

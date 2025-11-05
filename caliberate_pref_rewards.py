@@ -3,11 +3,10 @@ import torch
 import numpy as np
 from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from reward_utils import get_raw_preference_scores, set_seed # Import from our new file
+from reward_utils import get_raw_preference_scores, set_seed 
 import os
 
 # --- Constants ---
-# Use the same 'good' data as our preference model eval
 DATASET_NAME = "Anthropic/hh-rlhf"
 DATASET_SUBSETS = "harmless-base,helpful-base"
 EVAL_SPLIT = "test"
@@ -72,9 +71,13 @@ if __name__ == "__main__":
     )
     
     # --- 4. Compute and Print Stats ---
+    max_score=np.max(raw_scores)
+    min_score=np.min(raw_scores)
     mean_score = np.mean(raw_scores)
     std_score = np.std(raw_scores)
 
     print("\n--- Preference Model Calibration Results ---")
+    print(f"\nmax: {max_score:.4f}")
+    print(f"\nmin: {min_score:.4f}")
     print(f"\nPREF_MEAN: {mean_score:.4f}")
     print(f"PREF_STD:  {std_score:.4f}")

@@ -12,8 +12,10 @@ env/
 
 # Training outputs and model files
 gpt2-*/
-toxicity-classifier/
+ppo-*/
+toxicity-*/
 preference-*/
+results/
 runs/
 events.out.tfevents.*
 *.pth
@@ -22,6 +24,7 @@ events.out.tfevents.*
 *.bin
 model_checkpoints/
 checkpoint-*/
+logs/trl/
 
 # TensorBoard logs
 tensorboard_logs/
